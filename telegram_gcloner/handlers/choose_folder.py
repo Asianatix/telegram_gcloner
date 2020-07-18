@@ -35,8 +35,17 @@ def init(dispatcher: Dispatcher):
                                                 pattern=r'^(?:un)?set_folders(:?_page#\d+)?(?:\,[\dA-Za-z\-_]+)?$'))
 
 
+@restricted
 def chosen_folder(update, context):
-    if update.effective_user.id in config.USER_IDS or update.effective_user.id in context.bot_data['vip']:
+    query = update.callback_query
+    if query.message.chat_id < 0 and \
+            (not query.message.reply_to_message or
+             query.from_user.id != query.message.reply_to_message.from_user.id):
+        alert_users(context, update.effective_user, 'invalid caller', query.data)
+        query.answer(text='哟呵', show_alert=True)
+        return
+    if update.effective_user.id in config.USER_IDS\
+            or (context.bot_data.get('vip', None) and update.effective_user.id in context.bot_data['vip']):
         max_folders = default_max_folders_vip
     else:
         max_folders = default_max_folders
@@ -78,6 +87,7 @@ def chosen_folder(update, context):
         }
         context.user_data[udkey_folders] = new_fav_folders
         context.user_data[udkey_fav_folders_replace] = None
+        context.dispatcher.update_persistence()
         set_folders(update, context)
     else:
         query.answer(text='最多只能{}个'.format(max_folders), show_alert=True)
@@ -119,13 +129,14 @@ def choose_folder(update, context):
         rsp.done.wait(timeout=60)
         message_id = rsp.result().message_id
         if not folders:
-            # folders = context.user_data.get(udkey_fav_drives, None)
             folders = gd.get_drives()
             context.user_data[udkey_folders_cache] = copy.deepcopy(folders)
 
     if query:
-        logger.debug(str(query.data))
-        if query.from_user.id != query.message.chat_id:
+        logger.debug('{}: {}'.format(update.effective_user.id, query.data))
+        if query.message.chat_id < 0 and \
+                (not query.message.reply_to_message or
+                 query.from_user.id != query.message.reply_to_message.from_user.id):
             alert_users(context, update.effective_user, 'invalid caller', query.data)
             query.answer(text='哟呵', show_alert=True)
             return
@@ -157,7 +168,6 @@ def choose_folder(update, context):
             if not folders and match.group('page'):
                 folders = context.user_data.get(udkey_folders_cache, None)
             if not folders:
-                # folders = context.user_data.get(udkey_fav_drives, None)
                 folders = gd.get_drives()
                 context.user_data[udkey_folders_cache] = copy.deepcopy(folders)
             if not folders:
@@ -215,7 +225,8 @@ def choose_folder(update, context):
 
 @restricted
 def set_folders(update, context):
-    if update.effective_user.id in config.USER_IDS or update.effective_user.id in context.bot_data['vip']:
+    if update.effective_user.id in config.USER_IDS\
+            or (context.bot_data.get('vip', None) and update.effective_user.id in context.bot_data['vip']):
         max_folders = default_max_folders_vip
     else:
         max_folders = default_max_folders
@@ -228,6 +239,12 @@ def set_folders(update, context):
         rsp.done.wait(timeout=60)
         message_id = rsp.result().message_id
     else:
+        if query.message.chat_id < 0 and \
+                (not query.message.reply_to_message or
+                 query.from_user.id != query.message.reply_to_message.from_user.id):
+            alert_users(context, update.effective_user, 'invalid caller', query.data)
+            query.answer(text='哟呵', show_alert=True)
+            return
         message_id = query.message.message_id
     folder_ids = context.user_data.get(udkey_folders, None)
 
@@ -249,8 +266,6 @@ def set_folders(update, context):
         inline_keyboard_drive_ids.insert(0, [InlineKeyboardButton('新增一个收藏文件夹', callback_data=callback_query_prefix)])
     inline_keyboard_drive_ids.append([InlineKeyboardButton('完成', callback_data='cancel')])
 
-    for item in inline_keyboard_drive_ids:
-        logger.debug(str(item[0].text) + str(item[0].callback_data))
     context.bot.edit_message_text(chat_id=update.effective_chat.id,
                                   message_id=message_id,
                                   text='共{}/{}收藏文件夹：'.format(

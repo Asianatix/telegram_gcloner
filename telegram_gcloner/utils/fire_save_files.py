@@ -16,26 +16,36 @@ from utils.google_drive import GoogleDrive
 logger = logging.getLogger(__name__)
 
 
+thread_pool = {}
+
+
 class MySaveFileThread(threading.Thread):
     def __init__(self, args=(), kwargs=None):
         threading.Thread.__init__(self, args=(), kwargs=None)
         self.daemon = True
         self.args = args
         self.critical_fault = False
+        self.owner = -1
 
     def run(self):
         update, context, folder_ids, text, dest_folder = self.args
+        self.owner = update.effective_user.id
         thread_id = self.ident
         is_multiple_ids = len(folder_ids) > 1
-        chat_id = update.effective_user.id
-        gd = GoogleDrive(chat_id)
+        is_fclone = 'fclone' in os.path.basename(config.PATH_TO_GCLONE)
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        gd = GoogleDrive(user_id)
         message = '目标目录：{}\n\n'.format(dest_folder['path'])
         inline_keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton(text=f'停止', callback_data=f'stop_task,{thread_id}')]])
 
+        reply_message_id = update.callback_query.message.reply_to_message.message_id \
+            if update.callback_query.message.reply_to_message else None
         rsp = context.bot.send_message(chat_id=chat_id, text=message,
                                        parse_mode=ParseMode.HTML,
                                        disable_web_page_preview=True,
+                                       reply_to_message_id=reply_message_id,
                                        reply_markup=inline_keyboard)
         rsp.done.wait(timeout=60)
         message_id = rsp.result().message_id
@@ -50,12 +60,25 @@ class MySaveFileThread(threading.Thread):
                 '-P',
                 '--stats',
                 '1s',
-                '--transfers',
-                '6',
-                '--tpslimit',
-                '6',
                 '--ignore-existing'
             ]
+            if config.GCLONE_PARA_OVERRIDE:
+                command_line.extend(config.GCLONE_PARA_OVERRIDE)
+            elif is_fclone is True:
+                command_line += [
+                    '--checkers=256',
+                    '--transfers=256',
+                    '--drive-pacer-min-sleep=1ms',
+                    '--drive-pacer-burst=5000',
+                    '--check-first'
+                ]
+            else:
+                command_line += [
+                    '--transfers',
+                    '8',
+                    '--tpslimit',
+                    '6',
+                ]
             gclone_config = os.path.join(config.BASE_PATH,
                                          'gclone_config',
                                          str(update.effective_user.id),
@@ -84,10 +107,11 @@ class MySaveFileThread(threading.Thread):
             progress_transferred_size = '0'
             progress_total_size = '0 Bytes'
             progress_speed = '-'
+            progress_speed_file = '-'
             progress_eta = '-'
             progress_size_percentage_10 = 0
             regex_checked_files = r'Checks:\s+(\d+)\s+/\s+(\d+)'
-            regex_total_files = r'Transferred:\s+(\d+) / (\d+), (\d+)%'
+            regex_total_files = r'Transferred:\s+(\d+) / (\d+), (\d+)%(?:,\s*([\d.]+\sFiles/s))?'
             regex_total_size = r'Transferred:[\s]+([\d.]+\s*[kMGTP]?) / ([\d.]+[\s]?[kMGTP]?Bytes),' \
                                r'\s*(?:\-|(\d+)\%),\s*([\d.]+\s*[kMGTP]?Bytes/s),\s*ETA\s*([\-0-9hmsdwy]+)'
             message_progress_last = ''
@@ -106,13 +130,15 @@ class MySaveFileThread(threading.Thread):
                     break
                 output = line.rstrip()
                 if output:
-                    logger.debug(output)
+                    # logger.debug(output)
                     match_total_files = re.search(regex_total_files, output)
                     if match_total_files:
                         progress_transferred_file = int(match_total_files.group(1))
                         progress_total_files = int(match_total_files.group(2))
                         progress_file_percentage = int(match_total_files.group(3))
                         progress_file_percentage_10 = progress_file_percentage // 10
+                        if match_total_files.group(4):
+                            progress_speed_file = match_total_files.group(4)
                     match_total_size = re.search(regex_total_size, output)
                     if match_total_size:
                         progress_transferred_size = match_total_size.group(1)
@@ -130,8 +156,8 @@ class MySaveFileThread(threading.Thread):
                     message_progress = '<a href="https://drive.google.com/open?id={}">{}</a>\n' \
                                        '检查文件： <code>{} / {}</code>\n' \
                                        '文件数量： <code>{} / {}</code>\n' \
-                                       '任务容量：<code>{} / {}</code>\n' \
-                                       '传输速度：<code>{} ETA {}</code>\n' \
+                                       '任务容量：<code>{} / {}</code>\n{}' \
+                                       '复制速度：<code>{} ETA {}</code>\n' \
                                        '任务进度：<code>[{}] {: >4}%</code>' \
                         .format(
                         folder_id,
@@ -142,6 +168,7 @@ class MySaveFileThread(threading.Thread):
                         progress_total_files,
                         progress_transferred_size,
                         progress_total_size,
+                        f'任务速度：<code>{progress_speed_file}</code>\n' if is_fclone is True else '',
                         progress_speed,
                         progress_eta,
                         '█' * progress_file_percentage_10 + '░' * (
@@ -154,10 +181,14 @@ class MySaveFileThread(threading.Thread):
                         message_progress = '{}\n<code>写入权限错误，请确认权限</code>'.format(message_progress)
                         temp_message = '{}{}'.format(message, message_progress)
                         # logger.info('写入权限错误，请确认权限'.format())
-                        context.bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                                                      text=temp_message, parse_mode=ParseMode.HTML,
-                                                      disable_web_page_preview=True,
-                                                      reply_markup=inline_keyboard)
+                        try:
+                            context.bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                                          text=temp_message, parse_mode=ParseMode.HTML,
+                                                          disable_web_page_preview=True,
+                                                          reply_markup=inline_keyboard)
+                        except Exception as e:
+                            logger.debug('Error {} occurs when editing message {} for user {} in chat {}: \n{}'.format(
+                                e, message_id, user_id, chat_id, temp_message))
                         process.terminate()
                         self.critical_fault = True
                         break
@@ -167,10 +198,14 @@ class MySaveFileThread(threading.Thread):
                         message_progress = '{}\n<code>读取权限错误，请确认权限</code>'.format(message_progress)
                         temp_message = '{}{}'.format(message, message_progress)
                         # logger.info('读取权限错误，请确认权限：')
-                        context.bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                                                      text=temp_message, parse_mode=ParseMode.HTML,
-                                                      disable_web_page_preview=True,
-                                                      reply_markup=inline_keyboard)
+                        try:
+                            context.bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                                          text=temp_message, parse_mode=ParseMode.HTML,
+                                                          disable_web_page_preview=True,
+                                                          reply_markup=inline_keyboard)
+                        except Exception as e:
+                            logger.debug('Error {} occurs when editing message {} for user {} in chat {}: \n{}'.format(
+                                e, message_id, user_id, chat_id, temp_message))
                         process.terminate()
                         self.critical_fault = True
                         break
@@ -178,10 +213,15 @@ class MySaveFileThread(threading.Thread):
                     if message_progress != message_progress_last:
                         if datetime.datetime.now() - progress_update_time > datetime.timedelta(seconds=5):
                             temp_message = '{}{}'.format(message, message_progress)
-                            context.bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                                                          text=temp_message, parse_mode=ParseMode.HTML,
-                                                          disable_web_page_preview=True,
-                                                          reply_markup=inline_keyboard)
+                            try:
+                                context.bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                                              text=temp_message, parse_mode=ParseMode.HTML,
+                                                              disable_web_page_preview=True,
+                                                              reply_markup=inline_keyboard)
+                            except Exception as e:
+                                logger.debug(
+                                    'Error {} occurs when editing message {} for user {} in chat {}: \n{}'.format(
+                                        e, message_id, user_id, chat_id, temp_message))
                             message_progress_last = message_progress
                             progress_update_time = datetime.datetime.now()
 
@@ -198,7 +238,7 @@ class MySaveFileThread(threading.Thread):
                 if link:
                     link_text = '👉<a href="{}">Link</a>'.format(link)
             except Exception as e:
-                logger.info(e)
+                logger.info(str(e))
 
             if self.critical_fault is True:
                 message = '{}{}❌\n{}\n{}\n\n'.format(message, message_progress_heading, message_progress_content,
@@ -212,18 +252,34 @@ class MySaveFileThread(threading.Thread):
                                                       message_progress_content,
                                                       link_text)
 
-            context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message,
-                                          parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-                                          reply_markup=inline_keyboard)
+            try:
+                context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message,
+                                              parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                                              reply_markup=inline_keyboard)
+            except Exception as e:
+                logger.debug('Error {} occurs when editing message {} for user {} in chat {}: \n{}'.format(
+                    e, message_id, user_id, chat_id, message))
+
             if self.critical_fault is True:
                 break
 
-        message_append = 'Finished.'
-        message += message_append
-        context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message,
-                                      parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        message += 'Finished.'
+        try:
+            context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message,
+                                          parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except Exception as e:
+            logger.debug('Error {} occurs when editing message {} for user {} in chat {}: \n{}'.format(
+                e, message_id, user_id, chat_id, message))
         update.callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton(text='已完成', callback_data='cancel')]]))
+
+        logger.debug('User {} has finished task {}: \n{}'.format(user_id, thread_id, message))
+        tasks = thread_pool.get(user_id, None)
+        if tasks:
+            for t in tasks:
+                if t.ident == thread_id:
+                    tasks.remove(t)
+                    return
 
     def kill(self):
         self.critical_fault = True

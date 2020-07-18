@@ -5,6 +5,7 @@ import re
 
 from telegram.ext import Dispatcher, CallbackQueryHandler
 
+from utils.fire_save_files import thread_pool
 from utils.helper import alert_users
 from utils.restricted import restricted
 
@@ -21,15 +22,22 @@ def init(dispatcher: Dispatcher):
 @restricted
 def stop_task(update, context):
     query = update.callback_query
+    if query.message.chat_id < 0 and \
+            (not query.message.reply_to_message or
+             query.from_user.id != query.message.reply_to_message.from_user.id):
+        alert_users(context, update.effective_user, 'invalid caller', query.data)
+        query.answer(text='哟呵', show_alert=True)
+        return
     if query.data:
         match = re.search(regex_stop_task, query.data)
         if match:
             thread_id = int(match.group(1))
-            tasks = context.user_data.get('tasks', None)
+            tasks = thread_pool.get(update.effective_user.id, None)
             if tasks:
                 for t in tasks:
-                    if t.native_id == thread_id:
+                    if t.ident == thread_id and t.owner == query.from_user.id:
                         t.kill()
+                        logger.info('User {} has stopped task {}'.format(query.from_user.id, thread_id))
                         return
     alert_users(context, update.effective_user, 'invalid query data', query.data)
     query.answer(text='哟呵', show_alert=True)
